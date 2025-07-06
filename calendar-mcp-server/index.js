@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import 'dotenv/config';
+//console.log('✅ Loaded MONGODB_URI:', process.env.MONGODB_URI); // Debug check
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -9,11 +10,272 @@ import {
   McpError,
 } from '@modelcontextprotocol/sdk/types.js';
 import mongoose from 'mongoose';
+import fs from 'fs/promises';
+import path from 'path';
 
 // Import your models
 import Event from './models/Event.js';
 import List from './models/List.js';
 import Item from './models/Item.js';
+
+class ContextualMemory {
+  constructor(maxEntries = 100, persistPath = './memory.json') {
+    this.maxEntries = maxEntries;
+    this.persistPath = persistPath;
+    this.sessions = new Map(); // sessionId -> session data
+    this.loadFromDisk();
+  }
+
+  // Get or create session memory
+  getSession(sessionId = 'default') {
+    if (!this.sessions.has(sessionId)) {
+      this.sessions.set(sessionId, {
+        interactions: [],
+        context: {
+          recentEvents: [],
+          recentLists: [],
+          recentItems: [],
+          userPreferences: {},
+          currentFocus: null, // What the user is currently working on
+        },
+        metadata: {
+          created: new Date().toISOString(),
+          lastAccessed: new Date().toISOString(),
+        }
+      });
+    }
+    
+    const session = this.sessions.get(sessionId);
+    session.metadata.lastAccessed = new Date().toISOString();
+    return session;
+  }
+
+  // Add interaction to memory
+  addInteraction(sessionId, operation, params, result, context = {}) {
+    const session = this.getSession(sessionId);
+    
+    const interaction = {
+      timestamp: new Date().toISOString(),
+      operation,
+      params: this.sanitizeParams(params),
+      result: this.sanitizeResult(result),
+      context,
+    };
+
+    session.interactions.unshift(interaction);
+    
+    // Keep only recent interactions
+    if (session.interactions.length > this.maxEntries) {
+      session.interactions = session.interactions.slice(0, this.maxEntries);
+    }
+
+    // Update contextual information
+    this.updateContext(session, operation, params, result);
+    
+    this.saveToDisk();
+  }
+
+  // Update contextual understanding
+  updateContext(session, operation, params, result) {
+    const context = session.context;
+
+    switch (operation) {
+      case 'create_event':
+        if (result.success !== false) {
+          context.recentEvents.unshift({
+            id: this.extractId(result),
+            title: params.title,
+            startDate: params.startDate,
+            endDate: params.endDate,
+            operation: 'created',
+            timestamp: new Date().toISOString()
+          });
+          context.currentFocus = { type: 'event', id: this.extractId(result), title: params.title };
+        }
+        break;
+
+      case 'create_list':
+        if (result.success !== false) {
+          context.recentLists.unshift({
+            id: this.extractId(result),
+            name: params.name,
+            operation: 'created',
+            timestamp: new Date().toISOString()
+          });
+          context.currentFocus = { type: 'list', id: this.extractId(result), name: params.name };
+        }
+        break;
+
+      case 'create_item':
+        if (result.success !== false) {
+          context.recentItems.unshift({
+            id: this.extractId(result),
+            content: params.content,
+            listId: params.listId,
+            operation: 'created',
+            timestamp: new Date().toISOString()
+          });
+        }
+        break;
+
+      case 'get_events':
+        // Track what events user is interested in
+        if (params.calendarId) {
+          context.userPreferences.preferredCalendar = params.calendarId;
+        }
+        if (params.ownerId) {
+          context.userPreferences.userId = params.ownerId;
+        }
+        break;
+
+      case 'assign_list_to_event':
+        context.currentFocus = { 
+          type: 'event_list_relationship', 
+          eventId: params.eventId, 
+          listId: params.listId 
+        };
+        break;
+    }
+
+    // Keep recent arrays manageable
+    context.recentEvents = context.recentEvents.slice(0, 10);
+    context.recentLists = context.recentLists.slice(0, 10);
+    context.recentItems = context.recentItems.slice(0, 20);
+  }
+
+  // Get contextual suggestions
+  getContextualSuggestions(sessionId, currentOperation, currentParams) {
+    const session = this.getSession(sessionId);
+    const context = session.context;
+    const suggestions = [];
+
+    // Suggest based on recent activity
+    if (currentOperation === 'create_item' && !currentParams.listId) {
+      if (context.recentLists.length > 0) {
+        const recentList = context.recentLists[0];
+        suggestions.push(`You recently created a list "${recentList.name}" (${recentList.id}). Would you like to add this item there?`);
+      }
+    }
+
+    if (currentOperation === 'assign_list_to_event' && !currentParams.eventId) {
+      if (context.recentEvents.length > 0) {
+        const recentEvent = context.recentEvents[0];
+        suggestions.push(`You recently created event "${recentEvent.title}" (${recentEvent.id}). Is this the event you want to assign the list to?`);
+      }
+    }
+
+    // Suggest based on patterns
+    if (currentOperation === 'create_event' && context.userPreferences.preferredCalendar) {
+      suggestions.push(`Based on your activity, you might want to use calendar: ${context.userPreferences.preferredCalendar}`);
+    }
+
+    return suggestions;
+  }
+
+  // Get conversation context for AI
+  getConversationContext(sessionId, limit = 5) {
+    const session = this.getSession(sessionId);
+    const recentInteractions = session.interactions.slice(0, limit);
+    
+    const contextSummary = {
+      currentFocus: session.context.currentFocus,
+      recentActivity: recentInteractions.map(i => ({
+        operation: i.operation,
+        timestamp: i.timestamp,
+        summary: this.summarizeInteraction(i)
+      })),
+      userPreferences: session.context.userPreferences,
+      suggestions: this.getRecentEntitySuggestions(session.context)
+    };
+
+    return contextSummary;
+  }
+
+  // Get suggestions for IDs based on recent activity
+  getRecentEntitySuggestions(context) {
+    return {
+      events: context.recentEvents.map(e => ({ id: e.id, title: e.title, when: e.startDate })),
+      lists: context.recentLists.map(l => ({ id: l.id, name: l.name })),
+      items: context.recentItems.map(i => ({ id: i.id, content: i.content.substring(0, 50) + '...' }))
+    };
+  }
+
+  // Helper methods
+  sanitizeParams(params) {
+    // Remove sensitive data, keep structure
+    const sanitized = { ...params };
+    // You might want to remove sensitive fields here
+    return sanitized;
+  }
+
+  sanitizeResult(result) {
+    // Keep only essential result info
+    if (typeof result === 'object' && result.content) {
+      return { type: 'content', hasContent: true };
+    }
+    return result;
+  }
+
+  extractId(result) {
+    // Extract ID from result text
+    if (result?.content?.[0]?.text) {
+      const match = result.content[0].text.match(/ID:\s*([a-f0-9]{24})/i);
+      return match ? match[1] : null;
+    }
+    return null;
+  }
+
+  summarizeInteraction(interaction) {
+    const { operation, params } = interaction;
+    switch (operation) {
+      case 'create_event':
+        return `Created event "${params.title}"`;
+      case 'create_list':
+        return `Created list "${params.name}"`;
+      case 'create_item':
+        return `Added item "${params.content?.substring(0, 30)}..."`;
+      default:
+        return `Performed ${operation}`;
+    }
+  }
+
+  // Persistence
+  async saveToDisk() {
+    try {
+      const data = {
+        sessions: Object.fromEntries(this.sessions.entries()),
+        savedAt: new Date().toISOString()
+      };
+      await fs.writeFile(this.persistPath, JSON.stringify(data, null, 2));
+    } catch (error) {
+      console.error('Failed to save memory to disk:', error);
+    }
+  }
+
+  async loadFromDisk() {
+    try {
+      const data = await fs.readFile(this.persistPath, 'utf8');
+      const parsed = JSON.parse(data);
+      if (parsed.sessions) {
+        this.sessions = new Map(Object.entries(parsed.sessions));
+      }
+    } catch (error) {
+      // File doesn't exist or is corrupted, start fresh
+      console.error('Could not load memory from disk, starting fresh:', error.message);
+    }
+  }
+
+  // Clean up old sessions (call periodically)
+  cleanup(maxAge = 7 * 24 * 60 * 60 * 1000) { // 7 days
+    const cutoff = Date.now() - maxAge;
+    for (const [sessionId, session] of this.sessions) {
+      if (new Date(session.metadata.lastAccessed).getTime() < cutoff) {
+        this.sessions.delete(sessionId);
+      }
+    }
+    this.saveToDisk();
+  }
+}
 
 class CalendarMCPServer {
   constructor() {
@@ -33,7 +295,19 @@ class CalendarMCPServer {
     this.pendingOperations = new Map();
     this.operationCounter = 0;
 
+    // Initialize contextual memory
+    this.memory = new ContextualMemory();
+
     this.setupToolHandlers();
+  }
+
+  // Extract session ID from request (you might want to enhance this)
+  getSessionId(request) {
+    // For now, use a single session. In a real app, you might extract this from:
+    // - request headers
+    // - user authentication
+    // - client connection info
+    return 'default';
   }
 
   setupToolHandlers() {
@@ -41,7 +315,17 @@ class CalendarMCPServer {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
         tools: [
-          // Confirmation tool
+          {
+            name: 'get_context',
+            description: 'Get current conversation context and suggestions',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                operation: { type: 'string', description: 'Operation you are about to perform (optional)' },
+                params: { type: 'object', description: 'Parameters for the operation (optional)' }
+              }
+            }
+          },
           {
             name: 'confirm_operation',
             description: 'Confirm a pending operation',
@@ -55,8 +339,6 @@ class CalendarMCPServer {
               required: []
             }
           },
-
-          // Event CRUD operations
           {
             name: 'create_event',
             description: 'Create a new event',
@@ -133,8 +415,6 @@ class CalendarMCPServer {
               required: ['eventId']
             }
           },
-
-          // List CRUD operations
           {
             name: 'create_list',
             description: 'Create a new list',
@@ -179,13 +459,11 @@ class CalendarMCPServer {
               type: 'object',
               properties: {
                 listId: { type: 'string', description: 'List ID to delete' },
-                deleteItems: { type: 'boolean', description: 'Whether to delete associated items', default: false }
+                deleteItems: { type: 'boolean', default: false, description: 'Whether to delete associated items' }
               },
               required: ['listId']
             }
           },
-
-          // Item CRUD operations
           {
             name: 'create_item',
             description: 'Create a new item in a list',
@@ -232,8 +510,6 @@ class CalendarMCPServer {
               required: ['itemId']
             }
           },
-
-          // Relationship operations
           {
             name: 'assign_list_to_event',
             description: 'Assign a list to an event',
@@ -272,25 +548,45 @@ class CalendarMCPServer {
       };
     });
 
-    // Handle tool calls
+    // Handle tool calls with memory integration
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
+      const sessionId = this.getSessionId(request);
 
       try {
+        // Handle context request
+        if (name === 'get_context') {
+          return await this.handleGetContext(sessionId, args);
+        }
+
         // Handle confirmation separately
         if (name === 'confirm_operation') {
-          return await this.handleConfirmation(args);
+          const result = await this.handleConfirmation(args);
+          // Record confirmation in memory
+          this.memory.addInteraction(sessionId, 'confirm_operation', args, result);
+          return result;
         }
 
         // For read operations, execute immediately
         if (this.isReadOperation(name)) {
-          return await this.executeOperation(name, args);
+          const result = await this.executeOperation(name, args);
+          // Add to memory
+          this.memory.addInteraction(sessionId, name, args, result);
+          
+          // Enhance result with contextual suggestions
+          const enhancedResult = this.enhanceResultWithContext(sessionId, name, args, result);
+          return enhancedResult;
         }
 
         // For write operations, require confirmation
-        return await this.requestConfirmation(name, args);
+        const confirmationResult = await this.requestConfirmation(name, args);
+        // Don't add to memory yet - wait for confirmation
+        return confirmationResult;
 
       } catch (error) {
+        // Record error in memory
+        this.memory.addInteraction(sessionId, name, args, { error: error.message });
+        
         if (error instanceof McpError) {
           throw error;
         }
@@ -302,18 +598,108 @@ class CalendarMCPServer {
     });
   }
 
-  // Check if operation is read-only
+  // New method to handle context requests
+  async handleGetContext(sessionId, args) {
+    const context = this.memory.getConversationContext(sessionId);
+    
+    let suggestions = [];
+    if (args.operation && args.params) {
+      suggestions = this.memory.getContextualSuggestions(sessionId, args.operation, args.params);
+    }
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `📋 **Current Context**\n\n` +
+                `**Current Focus:** ${context.currentFocus ? 
+                  `${context.currentFocus.type} - ${context.currentFocus.title || context.currentFocus.name || context.currentFocus.id}` 
+                  : 'None'}\n\n` +
+                
+                `**Recent Activity:**\n${context.recentActivity.map(a => 
+                  `• ${a.summary} (${new Date(a.timestamp).toLocaleString()})`
+                ).join('\n') || 'No recent activity'}\n\n` +
+                
+                `**Available for Quick Reference:**\n` +
+                `• Recent Events: ${context.suggestions.events.map(e => `"${e.title}" (${e.id})`).join(', ') || 'None'}\n` +
+                `• Recent Lists: ${context.suggestions.lists.map(l => `"${l.name}" (${l.id})`).join(', ') || 'None'}\n` +
+                `• Recent Items: ${context.suggestions.items.length} items available\n\n` +
+                
+                (suggestions.length > 0 ? `**Suggestions:**\n${suggestions.map(s => `• ${s}`).join('\n')}\n\n` : '') +
+                
+                `**User Preferences:**\n${Object.entries(context.userPreferences).map(([k, v]) => `• ${k}: ${v}`).join('\n') || 'None set'}`
+        }
+      ]
+    };
+  }
+
+  // Enhance results with contextual information
+  enhanceResultWithContext(sessionId, operation, params, result) {
+    const suggestions = this.memory.getContextualSuggestions(sessionId, operation, params);
+    
+    if (suggestions.length === 0) {
+      return result;
+    }
+
+    // Add suggestions to the result
+    const originalText = result.content[0].text;
+    const enhancedText = originalText + '\n\n💡 **Contextual Suggestions:**\n' + 
+                        suggestions.map(s => `• ${s}`).join('\n');
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: enhancedText
+        }
+      ]
+    };
+  }
+
+  // Execute the confirmed operation (modified to record in memory)
+  async executeConfirmation(operationId, pendingOp, shouldConfirm) {
+    // Remove from pending operations
+    this.pendingOperations.delete(operationId);
+
+    if (!shouldConfirm) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `❌ Operation cancelled: ${pendingOp.name}`
+          }
+        ]
+      };
+    }
+
+    // Execute the confirmed operation
+    const result = await this.executeOperation(pendingOp.name, pendingOp.args);
+    
+    // Add to memory after successful execution
+    const sessionId = 'default'; // You might want to track this better
+    this.memory.addInteraction(sessionId, pendingOp.name, pendingOp.args, result);
+    
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `✅ Operation confirmed and executed:\n\n${result.content[0].text}`
+        }
+      ]
+    };
+  }
+
   isReadOperation(operationName) {
     const readOperations = [
       'get_events',
       'get_lists', 
       'get_items',
-      'get_event_with_list_and_items'
+      'get_event_with_list_and_items',
+      'get_context'
     ];
     return readOperations.includes(operationName);
   }
 
-  // Request confirmation for write operations
   async requestConfirmation(operationName, args) {
     const operationId = `op_${++this.operationCounter}_${Date.now()}`;
     
@@ -345,7 +731,6 @@ class CalendarMCPServer {
     };
   }
 
-  // Generate human-readable confirmation message
   generateConfirmationMessage(operationName, args) {
     switch (operationName) {
       case 'create_event':
@@ -386,7 +771,6 @@ class CalendarMCPServer {
     }
   }
 
-  // Handle confirmation response
   async handleConfirmation(args) {
     const { operationId, confirm, response } = args;
     
@@ -399,7 +783,7 @@ class CalendarMCPServer {
       if (!lastOp) {
         throw new McpError(
           ErrorCode.InvalidRequest,
-          'No pending operation found. Please specify an operationId or ensure there is a recent operation awaiting confirmation.'
+          'No pending operation found. Please make a request first.'
         );
       }
       
@@ -408,8 +792,8 @@ class CalendarMCPServer {
       
       // Parse natural language response
       const normalizedResponse = response.toLowerCase().trim();
-      const confirmWords = ['yes', 'y', 'confirm', 'proceed', 'ok', 'okay', 'continue', 'go', 'do it'];
-      const cancelWords = ['no', 'n', 'cancel', 'abort', 'stop', 'nope', 'negative'];
+      const confirmWords = ['yes', 'confirm', 'proceed', 'ok', 'y', 'go', 'continue'];
+      const cancelWords = ['no', 'cancel', 'abort', 'stop', 'n', 'decline'];
       
       let shouldConfirm;
       if (confirmWords.some(word => normalizedResponse.includes(word))) {
@@ -419,70 +803,50 @@ class CalendarMCPServer {
       } else {
         throw new McpError(
           ErrorCode.InvalidRequest,
-          'Please respond with a clear confirmation like "yes", "confirm", "proceed" OR "no", "cancel", "abort"'
+          'Please respond with "yes"/"confirm" to proceed or "no"/"cancel" to abort.'
         );
       }
       
-      // Clean up last_operation reference
-      this.pendingOperations.delete('last_operation');
-      
       return await this.executeConfirmation(actualOperationId, pendingOp, shouldConfirm);
     }
-    
-    // Handle structured confirmation
-    if (!operationId) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        'Either operationId or response must be provided'
-      );
-    }
-    
-    actualOperationId = operationId;
-    pendingOp = this.pendingOperations.get(actualOperationId);
-    
-    if (!pendingOp) {
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        `Operation ${actualOperationId} not found or has expired`
-      );
+
+    // Handle explicit operationId
+    if (operationId) {
+      pendingOp = this.pendingOperations.get(operationId);
+      if (!pendingOp) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          `No pending operation found with ID: ${operationId}`
+        );
+      }
+      
+      return await this.executeConfirmation(operationId, pendingOp, confirm);
     }
 
-    return await this.executeConfirmation(actualOperationId, pendingOp, confirm);
+    // Handle boolean confirm without operationId (use last operation)
+    if (typeof confirm === 'boolean') {
+      const lastOp = this.pendingOperations.get('last_operation');
+      if (!lastOp) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          'No pending operation found. Please make a request first.'
+        );
+      }
+      
+      actualOperationId = lastOp.id;
+      pendingOp = this.pendingOperations.get(actualOperationId);
+      
+      return await this.executeConfirmation(actualOperationId, pendingOp, confirm);
+    }
+
+    throw new McpError(
+      ErrorCode.InvalidRequest,
+      'Please provide either operationId + confirm, or a natural language response.'
+    );
   }
 
-  // Execute the confirmation logic
-  async executeConfirmation(operationId, pendingOp, shouldConfirm) {
-    // Remove from pending operations
-    this.pendingOperations.delete(operationId);
-
-    if (!shouldConfirm) {
-      return {
-        content: [
-          {
-            type: 'text',
-            text: `❌ Operation cancelled: ${pendingOp.name}`
-          }
-        ]
-      };
-    }
-
-    // Execute the confirmed operation
-    const result = await this.executeOperation(pendingOp.name, pendingOp.args);
-    
-    return {
-      content: [
-        {
-          type: 'text',
-          text: `✅ Operation confirmed and executed:\n\n${result.content[0].text}`
-        }
-      ]
-    };
-  }
-
-  // Execute the actual operation
   async executeOperation(name, args) {
     switch (name) {
-      // Event CRUD
       case 'create_event':
         return await this.createEvent(args);
       case 'get_events':
@@ -491,8 +855,6 @@ class CalendarMCPServer {
         return await this.updateEvent(args);
       case 'delete_event':
         return await this.deleteEvent(args);
-
-      // List CRUD
       case 'create_list':
         return await this.createList(args);
       case 'get_lists':
@@ -501,8 +863,6 @@ class CalendarMCPServer {
         return await this.updateList(args);
       case 'delete_list':
         return await this.deleteList(args);
-
-      // Item CRUD
       case 'create_item':
         return await this.createItem(args);
       case 'get_items':
@@ -511,322 +871,480 @@ class CalendarMCPServer {
         return await this.updateItem(args);
       case 'delete_item':
         return await this.deleteItem(args);
-
-      // Relationships
       case 'assign_list_to_event':
         return await this.assignListToEvent(args);
       case 'unassign_list_from_event':
         return await this.unassignListFromEvent(args);
       case 'get_event_with_list_and_items':
         return await this.getEventWithListAndItems(args);
-
       default:
         throw new McpError(
           ErrorCode.MethodNotFound,
-          `Unknown tool: ${name}`
+          `Unknown operation: ${name}`
         );
     }
   }
 
-  // Clean up expired pending operations (optional)
-  cleanupExpiredOperations() {
-    const now = Date.now();
-    const expireTime = 5 * 60 * 1000; // 5 minutes
-    
-    for (const [operationId, operation] of this.pendingOperations.entries()) {
-      if (now - operation.timestamp > expireTime) {
-        this.pendingOperations.delete(operationId);
-      }
-    }
-  }
-
-  // Event CRUD methods
+  // Event operations
   async createEvent(args) {
     const event = new Event(args);
     await event.save();
+    
     return {
       content: [
         {
           type: 'text',
-          text: `Event created successfully with ID: ${event._id}`,
-        },
-      ],
+          text: `✅ Event created successfully!\n\nID: ${event._id}\nTitle: ${event.title}\nStart: ${event.startDate}\nEnd: ${event.endDate}${event.location ? `\nLocation: ${event.location}` : ''}${event.description ? `\nDescription: ${event.description}` : ''}`
+        }
+      ]
     };
   }
 
   async getEvents(args) {
-    const query = {};
-    if (args.calendarId) query.calendarId = args.calendarId;
-    if (args.ownerId) query.ownerId = args.ownerId;
-    if (args.status) query.status = args.status;
-    if (args.listId) query.list = args.listId;
-    if (args.tags && args.tags.length > 0) query.tags = { $in: args.tags };
+    const filter = {};
+    
+    if (args.calendarId) filter.calendarId = args.calendarId;
+    if (args.ownerId) filter.ownerId = args.ownerId;
+    if (args.status) filter.status = args.status;
+    if (args.tags && args.tags.length > 0) filter.tags = { $in: args.tags };
+    if (args.listId) filter.listId = args.listId;
+    
     if (args.startDate || args.endDate) {
-      query.startDate = {};
-      if (args.startDate) query.startDate.$gte = new Date(args.startDate);
-      if (args.endDate) query.startDate.$lte = new Date(args.endDate);
+      filter.$or = [];
+      if (args.startDate) {
+        filter.$or.push({ startDate: { $gte: new Date(args.startDate) } });
+      }
+      if (args.endDate) {
+        filter.$or.push({ endDate: { $lte: new Date(args.endDate) } });
+      }
     }
 
-    const events = await Event.find(query).populate('list');
+    const events = await Event.find(filter).sort({ startDate: 1 });
+    
+    if (events.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No events found matching the criteria.'
+          }
+        ]
+      };
+    }
+
+    const eventList = events.map(event => 
+      `📅 **${event.title}**\n` +
+      `   ID: ${event._id}\n` +
+      `   Start: ${event.startDate}\n` +
+      `   End: ${event.endDate}\n` +
+      `   Status: ${event.status}\n` +
+      `   Calendar: ${event.calendarId}\n` +
+      `   Owner: ${event.ownerId}` +
+      (event.location ? `\n   Location: ${event.location}` : '') +
+      (event.description ? `\n   Description: ${event.description}` : '') +
+      (event.tags && event.tags.length > 0 ? `\n   Tags: ${event.tags.join(', ')}` : '') +
+      (event.listId ? `\n   List: ${event.listId}` : '')
+    ).join('\n\n');
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(events, null, 2),
-        },
-      ],
+          text: `Found ${events.length} event(s):\n\n${eventList}`
+        }
+      ]
     };
   }
 
   async updateEvent(args) {
     const { eventId, ...updateData } = args;
-    const event = await Event.findByIdAndUpdate(eventId, updateData, { new: true });
+    
+    const event = await Event.findByIdAndUpdate(
+      eventId,
+      updateData,
+      { new: true, runValidators: true }
+    );
+    
     if (!event) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Event not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Event with ID ${eventId} not found`
+      );
     }
+
     return {
       content: [
         {
           type: 'text',
-          text: `Event updated successfully: ${JSON.stringify(event, null, 2)}`,
-        },
-      ],
+          text: `✅ Event updated successfully!\n\nID: ${event._id}\nTitle: ${event.title}\nStart: ${event.startDate}\nEnd: ${event.endDate}${event.location ? `\nLocation: ${event.location}` : ''}${event.description ? `\nDescription: ${event.description}` : ''}`
+        }
+      ]
     };
   }
 
   async deleteEvent(args) {
     const event = await Event.findByIdAndDelete(args.eventId);
+    
     if (!event) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Event not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Event with ID ${args.eventId} not found`
+      );
     }
+
     return {
       content: [
         {
           type: 'text',
-          text: `Event deleted successfully`,
-        },
-      ],
+          text: `✅ Event "${event.title}" deleted successfully!`
+        }
+      ]
     };
   }
 
-  // List CRUD methods
+  // List operations
   async createList(args) {
     const list = new List(args);
     await list.save();
+    
     return {
       content: [
         {
           type: 'text',
-          text: `List created successfully with ID: ${list._id}`,
-        },
-      ],
+          text: `✅ List created successfully!\n\nID: ${list._id}\nName: ${list.name}${list.description ? `\nDescription: ${list.description}` : ''}\nUser: ${list.userId}`
+        }
+      ]
     };
   }
 
   async getLists(args) {
-    const query = {};
-    if (args.userId) query.userId = args.userId;
-    if (args.name) query.name = new RegExp(args.name, 'i');
+    const filter = {};
+    
+    if (args.userId) filter.userId = args.userId;
+    if (args.name) filter.name = new RegExp(args.name, 'i');
 
-    const lists = await List.find(query);
+    const lists = await List.find(filter).sort({ name: 1 });
+    
+    if (lists.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No lists found matching the criteria.'
+          }
+        ]
+      };
+    }
+
+    const listText = lists.map(list => 
+      `📝 **${list.name}**\n` +
+      `   ID: ${list._id}\n` +
+      `   User: ${list.userId}` +
+      (list.description ? `\n   Description: ${list.description}` : '')
+    ).join('\n\n');
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(lists, null, 2),
-        },
-      ],
+          text: `Found ${lists.length} list(s):\n\n${listText}`
+        }
+      ]
     };
   }
 
   async updateList(args) {
     const { listId, ...updateData } = args;
-    const list = await List.findByIdAndUpdate(listId, updateData, { new: true });
+    
+    const list = await List.findByIdAndUpdate(
+      listId,
+      updateData,
+      { new: true, runValidators: true }
+    );
+    
     if (!list) {
-      throw new McpError(ErrorCode.InvalidRequest, 'List not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `List with ID ${listId} not found`
+      );
     }
+
     return {
       content: [
         {
           type: 'text',
-          text: `List updated successfully: ${JSON.stringify(list, null, 2)}`,
-        },
-      ],
+          text: `✅ List updated successfully!\n\nID: ${list._id}\nName: ${list.name}${list.description ? `\nDescription: ${list.description}` : ''}`
+        }
+      ]
     };
   }
 
   async deleteList(args) {
     const list = await List.findByIdAndDelete(args.listId);
+    
     if (!list) {
-      throw new McpError(ErrorCode.InvalidRequest, 'List not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `List with ID ${args.listId} not found`
+      );
     }
 
     // Optionally delete associated items
     if (args.deleteItems) {
-      await Item.deleteMany({ listId: args.listId });
+      const deletedItems = await Item.deleteMany({ listId: args.listId });
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `✅ List "${list.name}" and ${deletedItems.deletedCount} associated items deleted successfully!`
+          }
+        ]
+      };
     }
-
-    // Remove list reference from events
-    await Event.updateMany({ list: args.listId }, { $unset: { list: 1 } });
 
     return {
       content: [
         {
           type: 'text',
-          text: `List deleted successfully${args.deleteItems ? ' (items also deleted)' : ''}`,
-        },
-      ],
+          text: `✅ List "${list.name}" deleted successfully!`
+        }
+      ]
     };
   }
 
-  // Item CRUD methods
+  // Item operations
   async createItem(args) {
     const item = new Item(args);
     await item.save();
+    
     return {
       content: [
         {
           type: 'text',
-          text: `Item created successfully with ID: ${item._id}`,
-        },
-      ],
+          text: `✅ Item created successfully!\n\nID: ${item._id}\nContent: ${item.content}\nList: ${item.listId}`
+        }
+      ]
     };
   }
 
   async getItems(args) {
-    const query = {};
-    if (args.listId) query.listId = args.listId;
-    if (args.content) query.content = new RegExp(args.content, 'i');
+    const filter = {};
+    
+    if (args.listId) filter.listId = args.listId;
+    if (args.content) filter.content = new RegExp(args.content, 'i');
 
-    const items = await Item.find(query).populate('listId');
+    const items = await Item.find(filter).sort({ createdAt: -1 });
+    
+    if (items.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: 'No items found matching the criteria.'
+          }
+        ]
+      };
+    }
+
+    const itemText = items.map(item => 
+      `• **${item.content}**\n` +
+      `  ID: ${item._id}\n` +
+      `  List: ${item.listId}`
+    ).join('\n\n');
+
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(items, null, 2),
-        },
-      ],
+          text: `Found ${items.length} item(s):\n\n${itemText}`
+        }
+      ]
     };
   }
 
   async updateItem(args) {
     const { itemId, ...updateData } = args;
-    const item = await Item.findByIdAndUpdate(itemId, updateData, { new: true });
+    
+    const item = await Item.findByIdAndUpdate(
+      itemId,
+      updateData,
+      { new: true, runValidators: true }
+    );
+    
     if (!item) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Item not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Item with ID ${itemId} not found`
+      );
     }
+
     return {
       content: [
         {
           type: 'text',
-          text: `Item updated successfully: ${JSON.stringify(item, null, 2)}`,
-        },
-      ],
+          text: `✅ Item updated successfully!\n\nID: ${item._id}\nContent: ${item.content}`
+        }
+      ]
     };
   }
 
   async deleteItem(args) {
     const item = await Item.findByIdAndDelete(args.itemId);
+    
     if (!item) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Item not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Item with ID ${args.itemId} not found`
+      );
     }
+
     return {
       content: [
         {
           type: 'text',
-          text: `Item deleted successfully`,
-        },
-      ],
+          text: `✅ Item "${item.content}" deleted successfully!`
+        }
+      ]
     };
   }
 
-  // Relationship methods
+  // Event-List relationship operations
   async assignListToEvent(args) {
     const event = await Event.findByIdAndUpdate(
       args.eventId,
-      { list: args.listId },
+      { listId: args.listId },
       { new: true }
-    ).populate('list');
+    );
     
     if (!event) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Event not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Event with ID ${args.eventId} not found`
+      );
+    }
+
+    const list = await List.findById(args.listId);
+    if (!list) {
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `List with ID ${args.listId} not found`
+      );
     }
 
     return {
       content: [
         {
           type: 'text',
-          text: `List assigned to event successfully: ${JSON.stringify(event, null, 2)}`,
-        },
-      ],
+          text: `✅ List "${list.name}" assigned to event "${event.title}" successfully!`
+        }
+      ]
     };
   }
 
   async unassignListFromEvent(args) {
     const event = await Event.findByIdAndUpdate(
       args.eventId,
-      { $unset: { list: 1 } },
+      { $unset: { listId: 1 } },
       { new: true }
     );
     
     if (!event) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Event not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Event with ID ${args.eventId} not found`
+      );
     }
 
     return {
       content: [
         {
           type: 'text',
-          text: `List unassigned from event successfully`,
-        },
-      ],
+          text: `✅ List assignment removed from event "${event.title}" successfully!`
+        }
+      ]
     };
   }
 
   async getEventWithListAndItems(args) {
-    const event = await Event.findById(args.eventId).populate('list');
+    const event = await Event.findById(args.eventId);
+    
     if (!event) {
-      throw new McpError(ErrorCode.InvalidRequest, 'Event not found');
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `Event with ID ${args.eventId} not found`
+      );
     }
 
-    let items = [];
-    if (event.list) {
-      items = await Item.find({ listId: event.list._id });
-    }
+    let result = `📅 **Event: ${event.title}**\n` +
+                `ID: ${event._id}\n` +
+                `Start: ${event.startDate}\n` +
+                `End: ${event.endDate}\n` +
+                `Status: ${event.status}\n` +
+                `Calendar: ${event.calendarId}\n` +
+                `Owner: ${event.ownerId}`;
 
-    const result = {
-      event: event.toObject(),
-      items: items
-    };
+    if (event.location) result += `\nLocation: ${event.location}`;
+    if (event.description) result += `\nDescription: ${event.description}`;
+    if (event.tags && event.tags.length > 0) result += `\nTags: ${event.tags.join(', ')}`;
+
+    if (event.listId) {
+      const list = await List.findById(event.listId);
+      if (list) {
+        result += `\n\n📝 **Assigned List: ${list.name}**\n`;
+        if (list.description) result += `Description: ${list.description}\n`;
+        
+        const items = await Item.find({ listId: event.listId }).sort({ createdAt: -1 });
+        if (items.length > 0) {
+          result += `\n**Items (${items.length}):**\n`;
+          result += items.map(item => `• ${item.content}`).join('\n');
+        } else {
+          result += '\nNo items in this list yet.';
+        }
+      }
+    } else {
+      result += '\n\n📝 No list assigned to this event.';
+    }
 
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(result, null, 2),
-        },
-      ],
+          text: result
+        }
+      ]
     };
   }
 
   async run() {
     // Connect to MongoDB
+    if (!process.env.MONGODB_URI) {
+      throw new Error('MONGODB_URI environment variable is required');
+    }
+
     try {
-      await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/calendar-mcp');
+      await mongoose.connect(process.env.MONGODB_URI);
       console.error('Connected to MongoDB');
     } catch (error) {
-      console.error('MongoDB connection error:', error);
+      console.error('Failed to connect to MongoDB:', error);
       process.exit(1);
     }
 
-    // Clean up expired operations every 5 minutes
+    // Set up cleanup
+    process.on('SIGINT', async () => {
+      console.error('Received SIGINT, cleaning up...');
+      this.memory.cleanup();
+      await mongoose.disconnect();
+      process.exit(0);
+    });
+
+    // Clean up old sessions periodically (every 6 hours)
     setInterval(() => {
-      this.cleanupExpiredOperations();
-    }, 5 * 60 * 1000);
+      this.memory.cleanup();
+    }, 6 * 60 * 60 * 1000);
 
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    console.error('Calendar MCP server running on stdio with confirmation enabled');
+    console.error('Calendar MCP server running on stdio');
   }
 }
 
